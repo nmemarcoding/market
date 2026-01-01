@@ -1,0 +1,5 @@
+pyautogui
+pytesseract
+pillow
+pynput
+PyQt5

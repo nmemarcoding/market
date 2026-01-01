@@ -1,6 +1,7 @@
 import sys
 import time
 import subprocess
+import threading
 
 import pyautogui
 import pytesseract
@@ -8,6 +9,10 @@ from PIL import Image
 from pynput import mouse
 
 from PyQt5 import QtWidgets, QtCore, QtGui
+
+
+# If needed, uncomment and set the Tesseract path manually:
+# pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
 
 
 # ------------ STEP 1: LET USER DRAG A BOX IN ANY WINDOW ------------
@@ -51,33 +56,39 @@ def get_region_by_drag():
 def say(text):
     """Non-blocking voice output"""
     if text:
-        subprocess.Popen(["say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            ["say", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
 
-# Pre-compiled config string (avoid recreation)
-OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789."
+# Allow digits, dot, and minus sign so you get the full numeric value
+OCR_CONFIG = "--psm 7 -c tessedit_char_whitelist=0123456789.-"
 
 def read_number_from_region(region):
     """Optimized OCR - minimal allocations"""
-    # Direct screenshot without intermediate variables
-    img = pyautogui.screenshot(region=region).convert("L")
-    
-    # OCR with pre-compiled config
+    # Make sure region is ints
+    left, top, width, height = region
+    region_int = (int(left), int(top), int(width), int(height))
+
+    img = pyautogui.screenshot(region=region_int).convert("L")
     raw = pytesseract.image_to_string(img, config=OCR_CONFIG)
-    
-    # Fast cleaning with early termination
+
+    # Keep digits, dot, minus
     result = []
     for ch in raw:
-        if ch.isdigit() or ch == '.':
+        if ch.isdigit() or ch in ('.', '-'):
             result.append(ch)
-    
+
     return ''.join(result) if result else ''
 
 
-# ------------ STEP 3: MAIN WINDOW (MINIMAL REPAINTS) ------------
+# ------------ STEP 3: MAIN WINDOW (MUTE + SELECT NEW AREA) ------------
 
 class NumberWindow(QtWidgets.QWidget):
     speaking_toggle = QtCore.pyqtSignal(bool)
+    reselect_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -91,38 +102,45 @@ class NumberWindow(QtWidgets.QWidget):
         font.setBold(True)
         self.label.setFont(font)
 
-        self.btn = QtWidgets.QPushButton("Mute Voice")
-        self.btn.setCheckable(True)
-        self.btn.toggled.connect(self.toggle_state)
+        self.btn_mute = QtWidgets.QPushButton("Mute Voice")
+        self.btn_mute.setCheckable(True)
+        self.btn_mute.toggled.connect(self.toggle_state)
+        self.btn_mute.setChecked(True)  # start MUTED by default
+
+        self.btn_reselect = QtWidgets.QPushButton("Select New Area")
+        self.btn_reselect.clicked.connect(self.request_reselect)
 
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.label)
-        layout.addWidget(self.btn)
+        layout.addWidget(self.btn_mute)
+        layout.addWidget(self.btn_reselect)
         self.setLayout(layout)
 
-        self.setFixedSize(200, 110)
-        
-        # Cache to prevent unnecessary updates
+        # Let the window be resizable so long numbers fit
+        self.setMinimumSize(220, 150)
+
         self._last_text = None
-        
+
         self.show()
 
     def toggle_state(self, checked):
         if checked:
-            self.btn.setText("Unmute Voice")
+            self.btn_mute.setText("Unmute Voice")
             self.speaking_toggle.emit(False)
         else:
-            self.btn.setText("Mute Voice")
+            self.btn_mute.setText("Mute Voice")
             self.speaking_toggle.emit(True)
 
+    def request_reselect(self):
+        self.reselect_requested.emit()
+
     def update_number(self, text):
-        # Only update if changed (critical for efficiency)
         if text != self._last_text:
             self.label.setText(text if text else "—")
             self._last_text = text
 
 
-# ------------ STEP 3.5: CURSOR BUBBLE (OPTIMIZED FOR FREQUENT UPDATES) ------------
+# ------------ STEP 3.5: CURSOR BUBBLE (FOLLOW MOUSE) ------------
 
 class CursorBubble(QtWidgets.QWidget):
     def __init__(self):
@@ -161,12 +179,10 @@ class CursorBubble(QtWidgets.QWidget):
         self.adjustSize()
         self.show()
 
-        # Optimized cursor following - 20 fps is sweet spot
         self.follow_timer = QtCore.QTimer(self)
         self.follow_timer.timeout.connect(self.follow_cursor)
         self.follow_timer.start(50)  # 20 fps
-        
-        # Cache for optimization
+
         self._last_pos = None
         self._last_text = None
 
@@ -174,8 +190,7 @@ class CursorBubble(QtWidgets.QWidget):
         pos = QtGui.QCursor.pos()
         new_x = pos.x() + 16
         new_y = pos.y() + 20
-        
-        # Only move if position changed by >3px (reduce micro-moves)
+
         if self._last_pos is None or \
            abs(new_x - self._last_pos[0]) > 3 or \
            abs(new_y - self._last_pos[1]) > 3:
@@ -183,14 +198,13 @@ class CursorBubble(QtWidgets.QWidget):
             self._last_pos = (new_x, new_y)
 
     def update_number(self, text):
-        # Only update if text changed (critical when updating every second)
         if text != self._last_text:
             self.label.setText(text if text else "—")
             self.adjustSize()
             self._last_text = text
 
 
-# ------------ STEP 4: READER THREAD (OPTIMIZED FOR 1-SECOND UPDATES) ------------
+# ------------ STEP 4: READER THREAD (REGION CAN CHANGE) ------------
 
 class ReaderThread(QtCore.QThread):
     number_changed = QtCore.pyqtSignal(str)
@@ -198,54 +212,69 @@ class ReaderThread(QtCore.QThread):
     def __init__(self, region):
         super().__init__()
         self.region = region
+        self.region_lock = threading.Lock()
 
-        # Fixed interval optimized for 1Hz updates
-        # 50ms = 20 reads/sec, ensures we catch every change
         self.INTERVAL = 0.05
         self.MIN_STABLE_READS = 2
 
-        self.speaking_enabled = True
+        self.speaking_enabled = False  # start MUTED by default
         self._stop = False
+        self.paused = False
+
+        self.last_spoken = None
+        self.last_emitted = None
+        self.candidate_value = None
+        self.candidate_count = 0
 
     def set_speaking(self, enabled: bool):
         self.speaking_enabled = enabled
+
+    def set_paused(self, paused: bool):
+        self.paused = paused
+
+    def update_region(self, region):
+        with self.region_lock:
+            self.region = region
+        # Reset detection state so we don't mix old/new area
+        self.last_spoken = None
+        self.last_emitted = None
+        self.candidate_value = None
+        self.candidate_count = 0
 
     def stop(self):
         self._stop = True
 
     def run(self):
-        last_spoken = None
-        last_emitted = None
-        candidate_value = None
-        candidate_count = 0
-
         while not self._stop:
-            value = read_number_from_region(self.region)
+            if self.paused:
+                time.sleep(self.INTERVAL)
+                continue
+
+            with self.region_lock:
+                region = self.region
+
+            value = read_number_from_region(region)
 
             if not value:
                 time.sleep(self.INTERVAL)
                 continue
 
-            # Check for stability
-            if value == candidate_value:
-                candidate_count += 1
+            if value == self.candidate_value:
+                self.candidate_count += 1
             else:
-                candidate_value = value
-                candidate_count = 1
+                self.candidate_value = value
+                self.candidate_count = 1
 
-            # Once stable, process
-            if candidate_count >= self.MIN_STABLE_READS:
-                # Only emit if value changed (reduces Qt signal overhead)
-                if candidate_value != last_emitted:
-                    self.number_changed.emit(candidate_value)
-                    last_emitted = candidate_value
+            if self.candidate_count >= self.MIN_STABLE_READS:
+                if self.candidate_value != self.last_emitted:
+                    self.number_changed.emit(self.candidate_value)
+                    self.last_emitted = self.candidate_value
 
-                # Only speak if enabled AND different from last spoken
-                if self.speaking_enabled and candidate_value != last_spoken:
-                    say(candidate_value)
-                    last_spoken = candidate_value
+                if self.speaking_enabled and self.candidate_value != self.last_spoken:
+                    say(self.candidate_value)
+                    self.last_spoken = self.candidate_value
 
-                candidate_count = 0
+                self.candidate_count = 0
 
             time.sleep(self.INTERVAL)
 
@@ -259,9 +288,10 @@ def main():
         return
 
     print(f"\n🎯 Selected region: {region}")
-    print("🟢 Now watching (optimized for 1Hz updates).")
-    print("🪟 Main window shows the live number + mute toggle.")
+    print("🟢 Now watching (optimized for ~1Hz changes).")
+    print("🪟 Main window shows the live number + mute toggle + 'Select New Area'.")
     print("📍 Tiny bubble follows your mouse showing the same number.")
+    print("🔇 Voice is MUTED by default (click 'Unmute Voice' to enable).")
     print("✋ Press Ctrl+C in terminal or close the window to quit.\n")
 
     app = QtWidgets.QApplication(sys.argv)
@@ -270,15 +300,32 @@ def main():
     bubble = CursorBubble()
     reader = ReaderThread(region)
 
-    # Connect signals (Qt handles thread safety efficiently)
     reader.number_changed.connect(main_window.update_number)
     reader.number_changed.connect(bubble.update_number)
     main_window.speaking_toggle.connect(reader.set_speaking)
 
+    # Handle "Select New Area" button
+    def handle_reselect():
+        print("\n🔁 Reselect requested. Pausing reader and asking for new area...")
+        reader.set_paused(True)
+
+        def _reselect_worker():
+            new_region = get_region_by_drag()
+            if new_region:
+                print(f"✅ New region selected: {new_region}")
+                reader.update_region(new_region)
+            else:
+                print("⚠️ Reselect cancelled or failed, keeping old region.")
+            reader.set_paused(False)
+
+        threading.Thread(target=_reselect_worker, daemon=True).start()
+
+    main_window.reselect_requested.connect(handle_reselect)
+
     def on_quit():
         reader.stop()
         reader.wait(1000)
-        
+
     app.aboutToQuit.connect(on_quit)
 
     reader.start()
@@ -287,5 +334,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    
